@@ -720,7 +720,7 @@ function Compress-Image {
                 throw "pigz.exe failed while creating gzip file for : $tmpName"
             }
         } finally {
-            Pop-Location
+		
         }
     } catch {
         Remove-Item -Force $tmpName -ErrorAction SilentlyContinue
