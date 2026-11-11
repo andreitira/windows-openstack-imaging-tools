@@ -208,32 +208,212 @@ function Disable-Swap {
     Write-Log "Swap" "Swap was disabled successfully"
 }
 
+function Get-WindowsKmsClientProduct {
+    <#
+    .SYNOPSIS
+     Returns the Windows licensing products that have a KMS client setup key
+     (GVLK, VOLUME_KMSCLIENT channel) installed, or nothing if there is none.
+     It reads the state through CIM, without slmgr.vbs (VBScript).
+    #>
+    $windowsApplicationId = "55c92734-d682-4d71-983e-d6ec3f16059f"
+    $productFilter = "ApplicationID = '{0}' AND PartialProductKey <> null" -f $windowsApplicationId
+    # Note: the same properties as slmgr.vbs /dli, which exist on every Windows version.
+    $productProperties = @("ID", "ApplicationID", "PartialProductKey", "LicenseIsAddon", "Description", "Name")
+    # Note: the Software Protection service can be slow to start right after
+    # a reboot or after updates were installed, so the query is retried.
+    $keyedProducts = ExecRetry {
+        Get-CimInstance -ClassName "SoftwareLicensingProduct" -Property $productProperties `
+            -Filter $productFilter -ErrorAction Stop
+    } -maxRetryCount 12 -retryInterval 10
+    return @($keyedProducts | Where-Object {
+        (-not $_.LicenseIsAddon) -and ($_.Description -like "*VOLUME_KMSCLIENT*")
+    })
+}
+
+function Update-WindowsLicenseStatus {
+    <#
+    .SYNOPSIS
+     Asks the Software Protection service to re-evaluate the licensing state,
+     as slmgr.vbs does after it uninstalls a product key. Best effort.
+    #>
+    try {
+        $licensingService = Get-CimInstance -ClassName "SoftwareLicensingService" -ErrorAction Stop |
+            Select-Object -First 1
+        Invoke-CimMethod -InputObject $licensingService -MethodName "RefreshLicenseStatus" `
+            -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Log "License" ("Warning: the license status could not be refreshed: {0}" -f $_.Exception.Message)
+    }
+}
+
+function Add-SoftwareLicensingClientType {
+    <#
+    .SYNOPSIS
+     Loads a small wrapper over the Software Licensing Client API (slc.dll),
+     used to uninstall a product key when the WMI method fails.
+    #>
+    if ("CloudbaseImaging.SoftwareLicensingClient" -as [type]) {
+        return
+    }
+    $source = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace CloudbaseImaging
+{
+    public static class SoftwareLicensingClient
+    {
+        [DllImport("slc.dll", ExactSpelling = true)]
+        private static extern int SLOpen(out IntPtr hSlc);
+
+        [DllImport("slc.dll", ExactSpelling = true)]
+        private static extern int SLClose(IntPtr hSlc);
+
+        [DllImport("slc.dll", ExactSpelling = true)]
+        private static extern int SLGetInstalledProductKeyIds(IntPtr hSlc, ref Guid productSkuId,
+            out uint productKeyIdCount, out IntPtr productKeyIds);
+
+        [DllImport("slc.dll", ExactSpelling = true)]
+        private static extern int SLUninstallProofOfPurchase(IntPtr hSlc, ref Guid productKeyId);
+
+        [DllImport("kernel32.dll", ExactSpelling = true)]
+        private static extern IntPtr LocalFree(IntPtr memory);
+
+        // Uninstalls the product keys installed for the given product SKU
+        // (the SoftwareLicensingProduct ID) and returns how many were removed.
+        public static int UninstallProductKeys(Guid productSkuId)
+        {
+            IntPtr hSlc;
+            int hr = SLOpen(out hSlc);
+            if (hr != 0)
+            {
+                throw new COMException(string.Format("SLOpen failed with 0x{0:X8}", hr), hr);
+            }
+            try
+            {
+                uint productKeyIdCount;
+                IntPtr productKeyIds;
+                hr = SLGetInstalledProductKeyIds(hSlc, ref productSkuId, out productKeyIdCount, out productKeyIds);
+                if (hr != 0)
+                {
+                    throw new COMException(string.Format(
+                        "SLGetInstalledProductKeyIds failed with 0x{0:X8}", hr), hr);
+                }
+                try
+                {
+                    int guidSize = Marshal.SizeOf(typeof(Guid));
+                    for (uint i = 0; i < productKeyIdCount; i++)
+                    {
+                        IntPtr productKeyIdPtr = new IntPtr(productKeyIds.ToInt64() + (long)i * guidSize);
+                        Guid productKeyId = (Guid)Marshal.PtrToStructure(productKeyIdPtr, typeof(Guid));
+                        hr = SLUninstallProofOfPurchase(hSlc, ref productKeyId);
+                        if (hr != 0)
+                        {
+                            throw new COMException(string.Format(
+                                "SLUninstallProofOfPurchase failed with 0x{0:X8}", hr), hr);
+                        }
+                    }
+                }
+                finally
+                {
+                    if (productKeyIds != IntPtr.Zero)
+                    {
+                        LocalFree(productKeyIds);
+                    }
+                }
+                return (int)productKeyIdCount;
+            }
+            finally
+            {
+                SLClose(hSlc);
+            }
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $source
+}
+
+function Remove-WindowsKmsClientProductKey {
+    <#
+    .SYNOPSIS
+     Uninstalls the KMS client setup key, the equivalent of "slmgr.vbs /upk".
+     slmgr.vbs is not used: on systems with the November 2026 Windows updates
+     "slmgr.vbs /upk" fails with "0x80041008 Invalid parameter (SWbemObjectEx)",
+     and VBScript is deprecated.
+     The key is removed with the WMI method SoftwareLicensingProduct.UninstallProductKey
+     and, if that does not work, with the Software Licensing Client API (slc.dll).
+     The installed key is checked before and after every attempt, so the function
+     can run again on every logon / reboot of the same VM: when no KMS client key
+     is installed, there is nothing to do.
+    #>
+    $kmsClientProducts = @(Get-WindowsKmsClientProduct)
+    if (!$kmsClientProducts) {
+        Write-Log "License" "KMS trial licensing reset not required. No KMS client product key is installed"
+        return
+    }
+    $partialKeys = ($kmsClientProducts | ForEach-Object { $_.PartialProductKey }) -join ", "
+    Write-Log "License" "Removing the KMS client product key (partial key: ${partialKeys})"
+
+    $failures = @()
+    $maxAttempts = 3
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        foreach ($removalMethod in @("WMI", "SLC")) {
+            foreach ($kmsClientProduct in $kmsClientProducts) {
+                try {
+                    if ($removalMethod -eq "WMI") {
+                        $methodResult = Invoke-CimMethod -InputObject $kmsClientProduct `
+                            -MethodName "UninstallProductKey" -ErrorAction Stop
+                        if ($methodResult.ReturnValue) {
+                            throw ("UninstallProductKey returned {0}" -f $methodResult.ReturnValue)
+                        }
+                    } else {
+                        Add-SoftwareLicensingClientType
+                        $productSkuId = [Guid]($kmsClientProduct.ID)
+                        [CloudbaseImaging.SoftwareLicensingClient]::UninstallProductKeys($productSkuId) | Out-Null
+                    }
+                } catch {
+                    $failure = "attempt {0}, {1}, product {2}: {3}" -f @($attempt, $removalMethod,
+                        $kmsClientProduct.ID, $_.Exception.Message)
+                    $failures += $failure
+                    Write-Log "License" "Warning: product key removal failed (${failure})"
+                }
+            }
+            Update-WindowsLicenseStatus
+            $kmsClientProducts = @(Get-WindowsKmsClientProduct)
+            if (!$kmsClientProducts) {
+                Write-Log "License" "KMS client product key removed (method: ${removalMethod})"
+                Write-Log "License" "KMS trial licensing was reset"
+                return
+            }
+        }
+        if ($attempt -lt $maxAttempts) {
+            Start-Sleep -Seconds 10
+        }
+    }
+    Write-Log "License" "Error: KMS trial licensing could not be reset"
+    throw ("The KMS client product key could not be removed. {0}" -f ($failures -join "; "))
+}
+
 function License-Windows {
     Param(
          [parameter(Mandatory=$true)]
          [string]$ProductKey
     )
-    $licenseWindows = $false
-    $slmgrOutput = cscript.exe "$env:windir\system32\slmgr.vbs" /dli
-    if ($lastExitCode) {
-        throw "Windows license details could not be retrieved."
-    }
-
     if ($ProductKey -eq "default_kms_key") {
         if (!([System.Environment]::OSVersion.Version.Major -gt 6 `
             -or [System.Environment]::OSVersion.Version.Minor -ge 2)) {
             Write-Log "License" 'KMS trial licensing reset not required. Running on Windows lte Windows 2008 R2'
             return
         }
-        if ($slmgrOutput -like "*VOLUME_KMSCLIENT*") {
-            $licensingOutput = cscript.exe "$env:windir\system32\slmgr.vbs" /upk
-            if ($LASTEXITCODE) {
-                Write-Log "License" "Error: KMS trial licensing could not be reset"
-                throw $licensingOutput
-            }
-            Write-Log "License" "KMS trial licensing was reset"
-        }
+        Remove-WindowsKmsClientProductKey
         return
+    }
+
+    $licenseWindows = $false
+    $slmgrOutput = cscript.exe "$env:windir\system32\slmgr.vbs" /dli
+    if ($lastExitCode) {
+        throw "Windows license details could not be retrieved."
     }
 
     if ($slmgrOutput -like "*License Status: Licensed*") {
